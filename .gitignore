@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Saved runs, word choices, experiments, and local settings
+Results/
+Decisions/
+Tests/
+settings.json
+.vscode/
+
+# The working term list and any file made from it
+dao_ideals.csv
+dao_ideals*
+
+# Cursor plan files
+.cursor/plans/
+*.plan.md
