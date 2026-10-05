@@ -396,6 +396,8 @@ def show_variant_window(
     on_text_size=None,
     register=None,
     stop_check=None,
+    definition="",
+    position=None,
 ):
     """Show the words and wait until Save or Cancel. Cancel returns None."""
     if text_size is None:
@@ -409,6 +411,8 @@ def show_variant_window(
         text_size=text_size,
         on_text_size=on_text_size,
         stop_check=stop_check,
+        definition=definition,
+        position=position,
     )
     if register is not None:
         register(dialog)
@@ -431,6 +435,8 @@ class VariantDialog:
         text_size=None,
         on_text_size=None,
         stop_check=None,
+        definition="",
+        position=None,
     ):
         self.result = None
         self.rows = []
@@ -438,12 +444,14 @@ class VariantDialog:
         self._drag_dir = 0
         self._drag_xy = (0, 0)
         self.category = category
+        self.definition = (definition or "").strip()
+        self.display_title = f"Words for {category.casefold()}"
         self.on_text_size = on_text_size
         self.text_size = clamp_text_size(
             DEFAULT_TEXT_SIZE if text_size is None else text_size
         )
         self.window = tk.Toplevel(parent)
-        self.window.title(f"New words for {category}")
+        self.window.title(self.display_title)
         self.window.geometry("900x720")
         self.window.minsize(700, 560)
         self.window.resizable(True, True)
@@ -460,8 +468,17 @@ class VariantDialog:
 
         intro = ttk.Frame(self.window, padding=8)
         intro.pack(fill="x")
+        self._counter = None
+        if position:
+            number, total = position
+            self._counter = ttk.Label(
+                intro,
+                text=f"Category {number} of {total}",
+                font=font_for("body", self.text_size),
+            )
+            self._counter.pack(side="right", anchor="ne")
         buttons = ttk.Frame(intro)
-        buttons.pack(anchor="w", pady=4)
+        buttons.pack(side="left", anchor="w", pady=4)
         ttk.Button(buttons, text="Check all", command=self.check_all).grid(
             row=0, column=0, padx=4, pady=2
         )
@@ -511,10 +528,9 @@ class VariantDialog:
         self.body._zoom = self.change_text_size
 
         self.apply_text_size(self.text_size)
-        self._write(
-            f"Words for {category}",
-            "heading",
-        )
+        self._write(self.display_title, "heading")
+        if self.definition:
+            self._write(self.definition, "source")
         self._write(
             (
                 f"These words start with “{stem}”. "
@@ -571,6 +587,8 @@ class VariantDialog:
             foreground="#767676",
         )
         self.body.configure(font=font_for("body", self.text_size))
+        if self._counter is not None:
+            self._counter.configure(font=font_for("body", self.text_size))
         self.body.tag_configure(
             "heading",
             font=font_for("heading", self.text_size),
@@ -726,7 +744,10 @@ class VariantDialog:
             self._drag_job = None
 
     def copy_all(self):
-        lines = [f"Words for {self.category}", ""]
+        lines = [self.display_title]
+        if self.definition:
+            lines.append(self.definition)
+        lines.append("")
         section = None
         for suggestion, variable in self.rows:
             if suggestion.get("section") != section:

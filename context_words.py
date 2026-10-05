@@ -8,7 +8,15 @@ import re
 from collections import Counter
 
 from corpus import check_stop, report_status
-from terms import _is_decimal_point, find_matches, flatten, terms_by_category
+from terms import (
+    _is_decimal_point,
+    find_matches,
+    flatten,
+    phrase_spans,
+    covering_rule,
+    rules_for_category,
+    terms_by_category,
+)
 
 # Ordinary English function words. Content words such as "system" stay available.
 FUNCTION_WORDS = frozenset(
@@ -138,7 +146,15 @@ def _too_few(category):
     }
 
 
-def _category_rows(sentences, category, terms):
+def _counted_hits(text, terms, rules):
+    hits = find_matches(text, terms)
+    if not rules or not hits:
+        return hits
+    spans = phrase_spans(text, rules)
+    return [hit for hit in hits if covering_rule(hit, spans) is None]
+
+
+def _category_rows(sentences, category, terms, rules=None):
     blocked = {normalize_phrase(term.term) for term in terms}
     focus_uni = Counter()
     focus_bi = Counter()
@@ -148,7 +164,7 @@ def _category_rows(sentences, category, terms):
     is_focus = []
 
     for text, tokens in sentences:
-        hits = find_matches(text, terms)
+        hits = _counted_hits(text, terms, rules)
         is_focus.append(bool(hits))
         if not hits:
             continue
@@ -246,7 +262,7 @@ def _category_rows(sentences, category, terms):
     return rows
 
 
-def context_rows(documents, terms, status=None, should_stop=None):
+def context_rows(documents, terms, status=None, should_stop=None, exclusions=None):
     """One block of rows per category, in category order."""
     grouped = terms_by_category(terms)
     order = []
@@ -277,5 +293,12 @@ def context_rows(documents, terms, status=None, should_stop=None):
         )
         category_terms = grouped.get(category, [])
         if category_terms:
-            rows.extend(_category_rows(sentences, category, category_terms))
+            rows.extend(
+                _category_rows(
+                    sentences,
+                    category,
+                    category_terms,
+                    rules_for_category(exclusions or [], category),
+                )
+            )
     return rows

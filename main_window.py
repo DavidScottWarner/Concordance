@@ -27,7 +27,6 @@ from settings_store import (
     save_settings,
 )
 from terms import categories_in_order, load_terms
-from variants import reset_category_decisions, reset_message
 
 NOTE_COLOR = "#767676"
 RUN_COLOR = "#1f77b4"
@@ -98,6 +97,30 @@ class AccentButton(tk.Frame):
         self.label.configure(font=font)
 
 
+def _parse_integer(text, message):
+    """A whole number, including negatives. Returns (number, error)."""
+    raw = (text or "").strip()
+    if raw.startswith("-"):
+        digits = raw[1:]
+        negative = True
+    else:
+        digits = raw
+        negative = False
+    if not digits.isdigit():
+        return None, message
+    number = int(digits)
+    return (-number if negative else number), None
+
+
+def _parse_nonnegative(text, invalid_message, negative_message):
+    number, error = _parse_integer(text, invalid_message)
+    if error:
+        return None, error
+    if number < 0:
+        return None, negative_message
+    return number, None
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -156,6 +179,7 @@ class App:
 
         self.corpus_var = tk.StringVar()
         self.term_var = tk.StringVar()
+        self.exclusion_var = tk.StringVar()
         self.metadata_var = tk.StringVar()
         self.path_column_var = tk.StringVar()
         self.group_column_var = tk.StringVar(value="(none)")
@@ -163,6 +187,8 @@ class App:
         self.strip_var = tk.BooleanVar(value=True)
         self.headers_var = tk.BooleanVar(value=False)
         self.short_var = tk.StringVar(value="50")
+        self.sample_size_var = tk.StringVar(value="100")
+        self.sample_seed_var = tk.StringVar(value="1")
         self.language_var = tk.StringVar(value="All languages")
         self.category_var = tk.StringVar(value="All categories")
         self.context_var = tk.BooleanVar(value=True)
@@ -262,6 +288,15 @@ class App:
 
     def _fill_terms(self, parent):
         row = self._path_row(parent, 0, "Term list", self.term_var, self.browse_terms)
+        row = self._path_row(
+            parent, row, "Exclusion list", self.exclusion_var, self.browse_exclusions
+        )
+        self._note(
+            parent,
+            row,
+            "Optional. A CSV with category and phrase. A blank category applies to every category.",
+        )
+        row += 1
         self._field_label(parent, "Category to run").grid(row=row, column=0, sticky="w", pady=(10, 2))
         self.category_box = ttk.Combobox(
             parent,
@@ -271,18 +306,12 @@ class App:
         self.category_box.grid(row=row + 1, column=0, sticky="ew")
         word_actions = ttk.Frame(parent)
         word_actions.grid(row=row + 2, column=0, sticky="w", pady=(8, 0))
-        self.reset_button = ttk.Button(
-            word_actions,
-            text="Redo word choices for this category",
-            command=self.on_reset,
-        )
-        self.reset_button.pack(side="left")
         self.review_button = ttk.Button(
             word_actions,
             text="Review word choices",
             command=self.on_review,
         )
-        self.review_button.pack(side="left", padx=(8, 0))
+        self.review_button.pack(side="left")
 
     def _fill_options(self, parent):
         background = self.root.cget("bg")
@@ -338,12 +367,30 @@ class App:
         )
         self.language_box.grid(row=6, column=0, sticky="w")
         self._note(parent, 7, "Counts include only documents in this language.")
+        self._field_label(parent, "Coding sample size per category").grid(
+            row=8, column=0, sticky="w", pady=(10, 2)
+        )
+        ttk.Entry(parent, textvariable=self.sample_size_var, width=8).grid(
+            row=9, column=0, sticky="w"
+        )
+        self._note(
+            parent,
+            10,
+            "Use 0 to code every match in the counts. Otherwise each category gets a sample of this size.",
+        )
+        self._field_label(parent, "Sample seed").grid(
+            row=11, column=0, sticky="w", pady=(10, 2)
+        )
+        ttk.Entry(parent, textvariable=self.sample_seed_var, width=8).grid(
+            row=12, column=0, sticky="w"
+        )
+        self._note(parent, 13, "The same seed draws the same sample again.")
         SameCheck(
             parent,
             self.context_var,
             text="Also list words found near the terms",
             background=background,
-        ).grid(row=8, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=14, column=0, sticky="w", pady=(10, 0))
 
     def _fill_results(self, parent):
         self._path_row(parent, 0, "Results folder", self.results_var, self.browse_results)
@@ -443,9 +490,7 @@ class App:
 
     def _persist_text_size(self):
         config, _problem = self.read_config()
-        raw_limit = self.short_var.get().strip()
-        if raw_limit and not raw_limit.isdigit():
-            config.short_word_limit = self.saved.short_word_limit
+        self._keep_saved_numbers(config)
         try:
             save_settings(config)
         except OSError:
@@ -479,11 +524,14 @@ class App:
             self.group_column_var.set("(none)")
         self.corpus_var.set(config.corpus_folder)
         self.term_var.set(config.term_list)
+        self.exclusion_var.set(getattr(config, "exclusion_list", "") or "")
         self.metadata_var.set(config.metadata_file)
         self.results_var.set(config.results_folder)
         self.strip_var.set(config.strip_formatting)
         self.headers_var.set(config.use_headers)
         self.short_var.set(str(config.short_word_limit))
+        self.sample_size_var.set(str(config.sample_size))
+        self.sample_seed_var.set(str(config.sample_seed))
         self.language_var.set(config.count_language or "All languages")
         self.category_var.set(config.category or "All categories")
         self.context_var.set(bool(config.context_words))
@@ -508,12 +556,22 @@ class App:
                 limit_error = "The short-document cutoff cannot be negative. Use 0 to flag nothing."
             else:
                 limit_error = None
+        sample_size, sample_error = _parse_nonnegative(
+            self.sample_size_var.get(),
+            "The coding sample size needs to be a whole number. Use 0 to code every match.",
+            "The coding sample size cannot be negative. Use 0 to code every match.",
+        )
+        sample_seed, seed_error = _parse_integer(
+            self.sample_seed_var.get(),
+            "The sample seed needs to be a whole number, such as 1.",
+        )
         group = self.group_column_var.get().strip()
         if group == "(none)":
             group = ""
         config = RunConfig(
             corpus_folder=expand_path(self.corpus_var.get()),
             term_list=expand_path(self.term_var.get()),
+            exclusion_list=expand_path(self.exclusion_var.get()),
             metadata_file=expand_path(self.metadata_var.get()),
             path_column=self.path_column_var.get().strip(),
             group_column=group,
@@ -522,12 +580,14 @@ class App:
             use_headers=bool(self.headers_var.get()),
             header_fields=self.checked_header_fields(),
             short_word_limit=limit,
+            sample_size=100 if sample_size is None else sample_size,
+            sample_seed=1 if sample_seed is None else sample_seed,
             count_language=self.language_var.get().strip() or "All languages",
             category=self.category_var.get().strip() or "All categories",
             text_size=self.text_size,
             context_words=bool(self.context_var.get()),
         )
-        return config, limit_error
+        return config, limit_error or sample_error or seed_error
 
     def set_status(self, text):
         self.status_var.set(text)
@@ -576,9 +636,6 @@ class App:
         self._busy = busy
         self.run_button.config(state="disabled" if busy else "normal")
         self.find_headers_button.config(state="disabled" if busy else "normal")
-        self.reset_button.config(
-            state="disabled" if busy in {"run", "review", "review-open"} else "normal"
-        )
         self.review_button.config(state="disabled" if busy else "normal")
         self.stop_button.config(state="normal" if busy in {"run", "review"} else "disabled")
 
@@ -662,6 +719,15 @@ class App:
         )
         if chosen:
             self.term_var.set(chosen)
+
+    def browse_exclusions(self):
+        chosen = filedialog.askopenfilename(
+            title="Choose the exclusion list",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialdir=self._initial_dir(self.exclusion_var.get() or self.term_var.get()),
+        )
+        if chosen:
+            self.exclusion_var.set(chosen)
 
     def browse_metadata(self):
         chosen = filedialog.askopenfilename(
@@ -849,35 +915,6 @@ class App:
         self.show_header_fields(fields)
         self.status_var.set(f"Found {len(fields)} header fields. Tick the ones to search.")
 
-    def on_reset(self):
-        config, _problem = self.read_config()
-        category = self.category_var.get().strip()
-        if not category or category == "All categories":
-            messagebox.showinfo(
-                "Concordance",
-                "Choose one category in the Category menu, then reset its word decisions.",
-                parent=self.root,
-            )
-            return
-        if not config or not config.term_list or not Path(config.term_list).is_file():
-            messagebox.showerror("Concordance", "Choose a term list first.", parent=self.root)
-            return
-        agreed = messagebox.askyesno(
-            "Concordance",
-            f"Forget the saved word choices for {category}?\n\n"
-            "The term list is left as it is. "
-            "The next run starts from the term list alone: those words begin ticked, "
-            "and every other word begins unticked.",
-            parent=self.root,
-        )
-        if not agreed:
-            return
-        forgotten = reset_category_decisions(config.term_list, category)
-        save_settings(config)
-        text = reset_message(category, forgotten)
-        self.set_status(text)
-        messagebox.showinfo("Concordance", text, parent=self.root)
-
     def on_review(self):
         from corpus import RunStopped
         from terms import load_terms, select_terms
@@ -962,6 +999,7 @@ class App:
         messagebox.showerror("Concordance", text, parent=self.root)
 
     def _show_review(self, config, category, stem, rows, terms):
+        from terms import category_definitions
         from variant_window import show_variant_window
         from variants import apply_choices
 
@@ -982,6 +1020,7 @@ class App:
             text_size=self.text_size,
             on_text_size=self.set_text_size,
             register=self._register_variant,
+            definition=category_definitions(terms).get(category, ""),
         )
         self._set_busy(None)
         if choices is None:
@@ -1035,7 +1074,7 @@ class App:
         self._set_busy("run")
         self._apply_progress("Starting...", None, None)
 
-        def prompter(category, stem, suggestions, related):
+        def prompter(category, stem, suggestions, related, definition="", position=None):
             holder = {}
             done = threading.Event()
 
@@ -1051,6 +1090,8 @@ class App:
                         on_text_size=self.set_text_size,
                         register=self._register_variant,
                         stop_check=self._stop_requested.is_set,
+                        definition=definition,
+                        position=position,
                     )
                 except Exception as error:
                     holder["error"] = error
@@ -1105,11 +1146,19 @@ class App:
 
     def on_close(self):
         config, _problem = self.read_config()
-        raw_limit = self.short_var.get().strip()
-        if raw_limit and not raw_limit.isdigit():
-            config.short_word_limit = self.saved.short_word_limit
+        self._keep_saved_numbers(config)
         try:
             save_settings(config)
         except OSError:
             pass
         self.root.destroy()
+
+    def _keep_saved_numbers(self, config):
+        """A half-typed number is not saved over the number already remembered."""
+        raw_limit = self.short_var.get().strip()
+        if raw_limit and not raw_limit.isdigit():
+            config.short_word_limit = self.saved.short_word_limit
+        if _parse_nonnegative(self.sample_size_var.get(), "", "")[0] is None:
+            config.sample_size = self.saved.sample_size
+        if _parse_integer(self.sample_seed_var.get(), "")[0] is None:
+            config.sample_seed = self.saved.sample_seed

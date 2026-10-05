@@ -49,6 +49,9 @@ class RunConfig:
     category: str = "All categories"
     text_size: int = DEFAULT_TEXT_SIZE
     context_words: bool = True
+    exclusion_list: str = ""
+    sample_size: int = 100
+    sample_seed: int = 1
 
 
 def preferred_settings_path():
@@ -125,6 +128,18 @@ def load_settings():
         config.text_size = clamp_text_size(data.get("text_size", DEFAULT_TEXT_SIZE))
         if "context_words" in data:
             config.context_words = bool(data.get("context_words"))
+        if "exclusion_list" in data:
+            config.exclusion_list = expand_path(data.get("exclusion_list") or "")
+        try:
+            config.sample_size = int(data.get("sample_size", 100))
+        except (TypeError, ValueError):
+            config.sample_size = 100
+        if config.sample_size < 0:
+            config.sample_size = 100
+        try:
+            config.sample_seed = int(data.get("sample_seed", 1))
+        except (TypeError, ValueError):
+            config.sample_seed = 1
     if not config.term_list and DEFAULT_TERM_LIST.is_file():
         config.term_list = str(DEFAULT_TERM_LIST)
     return config
@@ -162,6 +177,11 @@ def validate_config(config):
             "The tool saves word decisions next to it and must not change the corpus."
         )
 
+    if config.exclusion_list:
+        exclusion_list = Path(config.exclusion_list)
+        if not exclusion_list.is_file():
+            return "The exclusion list could not be found."
+
     if not config.results_folder:
         return "Choose a folder where the results should be saved."
     results = Path(config.results_folder)
@@ -186,4 +206,14 @@ def validate_config(config):
         return "The short-document cutoff needs to be a whole number. Use 0 to flag nothing."
     if limit < 0:
         return "The short-document cutoff cannot be negative. Use 0 to flag nothing."
+    try:
+        sample_size = int(config.sample_size)
+    except (TypeError, ValueError):
+        return "The coding sample size needs to be a whole number. Use 0 to code every match."
+    if sample_size < 0:
+        return "The coding sample size cannot be negative. Use 0 to code every match."
+    try:
+        int(config.sample_seed)
+    except (TypeError, ValueError):
+        return "The sample seed needs to be a whole number, such as 1."
     return None

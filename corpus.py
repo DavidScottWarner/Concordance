@@ -129,23 +129,36 @@ def report_status(status, message, current=None, total=None):
 
 
 def split_header(text):
-    """Separate opening header lines from the body.
+    """Separate opening header lines from the title and the body.
 
-    Only lines before the first blank line can be headers, and only when every
-    one of those lines is a single-word key such as title: or scores_total:.
+    The opening block starts with a single-word key such as title: or
+    scores_total:. Each key line before the first blank line is one header
+    field. A line that is not a key continues the previous field, so a wrapped
+    title or a wrapped choices list stays with that field. The body is
+    everything after the blank line.
+
+    Some files are only header lines and have no blank line at the end. Those
+    lines are still the header, and the body is empty. Otherwise keys such as
+    scores_total, state, and discussion would be counted as text. An underscore
+    is not part of a word, so scores_total would be counted as "scores total".
     """
     lines = text.splitlines()
     if not lines or not HEADER_LINE.match(lines[0].strip("\ufeff").strip()):
         return {}, text
     header = {}
+    last_key = None
     for index, line in enumerate(lines):
         if line.strip() == "":
             return header, "\n".join(lines[index + 1 :])
         match = HEADER_LINE.match(line.strip())
-        if not match:
+        if match:
+            last_key = match.group(1).lower()
+            header[last_key] = match.group(2).strip()
+            continue
+        if last_key is None:
             return {}, text
-        header[match.group(1).lower()] = match.group(2).strip()
-    return {}, text
+        header[last_key] = (header[last_key] + "\n" + line.strip()).strip()
+    return header, ""
 
 
 def clean_text(text):

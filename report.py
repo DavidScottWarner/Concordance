@@ -1,10 +1,13 @@
 """Write one dated results folder for a run."""
 
 import csv
+import hashlib
+import math
 import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+from statistics import NormalDist
 
 from terms import write_terms
 from variants import DECISION_COLUMNS, decisions_path, read_decision_rows
@@ -20,6 +23,7 @@ RESERVED_COLUMNS = {
     "term",
     "location",
     "sentence",
+    "in_sample",
     "keep",
     "notes",
 }
@@ -325,6 +329,94 @@ def keep_class(value):
     return "unclear"
 
 
+def _sample_rank(seed, match):
+    """A stable number for one match. The same inputs always give the same number."""
+    text = "\n".join(
+        [
+            str(int(seed)),
+            _cell_text(match.get("file_path")),
+            _cell_text(match.get("category")),
+            _cell_text(match.get("term")),
+            _cell_text(match.get("location")),
+            str(match.get("start", "")),
+        ]
+    )
+    return hashlib.sha256(text.encode("utf-8")).digest()
+
+
+def assign_sample(matches, sample_size, seed, count_language):
+    """Mark which counted matches are in the coding sample for their category."""
+    eligible = {}
+    for match in matches:
+        match["in_sample"] = False
+        if not include_in_counts(match.get("language"), count_language):
+            continue
+        eligible.setdefault(match.get("category"), []).append(match)
+    size = int(sample_size)
+    for group in eligible.values():
+        if size <= 0 or len(group) <= size:
+            chosen = group
+        else:
+            ranked = sorted(
+                group,
+                key=lambda match: (
+                    _sample_rank(seed, match),
+                    match.get("start", 0),
+                    _cell_text(match.get("sentence")),
+                ),
+            )
+            chosen = ranked[:size]
+        for match in chosen:
+            match["in_sample"] = True
+
+
+def _wilson_bounds(kept, coded):
+    """A 95% Wilson interval for the share of kept matches."""
+    z = NormalDist().inv_cdf(0.975)
+    phat = kept / coded
+    z2 = z * z
+    denominator = 1.0 + z2 / coded
+    center = (phat + z2 / (2.0 * coded)) / denominator
+    margin = (
+        z
+        * math.sqrt(phat * (1.0 - phat) / coded + z2 / (4.0 * coded * coded))
+        / denominator
+    )
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
+def _share_text(value):
+    return f"{value:.4f}"
+
+
+def _sample_estimates(chosen):
+    """Estimates from the coded sample. Blank when none of the sample is coded."""
+    sampled = [match for match in chosen if match.get("in_sample")]
+    coded = [
+        match
+        for match in sampled
+        if keep_class(match.get("keep")) in {"kept", "not_kept"}
+    ]
+    kept = sum(1 for match in coded if keep_class(match.get("keep")) == "kept")
+    result = {
+        "sample_size": len(sampled),
+        "sample_coded": len(coded),
+        "share_kept": "",
+        "share_kept_low": "",
+        "share_kept_high": "",
+        "estimated_kept": "",
+    }
+    if not coded:
+        return result
+    share = kept / len(coded)
+    low, high = _wilson_bounds(kept, len(coded))
+    result["share_kept"] = _share_text(share)
+    result["share_kept_low"] = _share_text(low)
+    result["share_kept_high"] = _share_text(high)
+    result["estimated_kept"] = f"{share * len(chosen):.1f}"
+    return result
+
+
 def _keep_tally(matches):
     tally = {"kept": 0, "not_kept": 0, "uncoded": 0, "unclear": 0}
     for match in matches:
@@ -343,6 +435,7 @@ _MATCH_WIDTHS = {
     "keep": 16,
     "notes": 32,
     "sentence": 80,
+    "in_sample": 12,
 }
 _NARROW_WIDTH = 14
 
@@ -470,6 +563,7 @@ def match_sheet_fields(match_fields, group_name, date_name, title_name):
     for name in (
         "term",
         "sentence",
+        "in_sample",
         "keep",
         "notes",
         "category",
@@ -487,6 +581,37 @@ def match_sheet_fields(match_fields, group_name, date_name, title_name):
     return body + discussion + url
 
 
+def _excluded_sheet_fields(match_fields, group_name, date_name, title_name):
+    """The Matches reading order, with the excluding phrase beside the term."""
+    fields = match_sheet_fields(match_fields, group_name, date_name, title_name)
+    if "phrase" in fields:
+        fields.remove("phrase")
+    if "term" in fields:
+        fields.insert(fields.index("term") + 1, "phrase")
+    else:
+        fields.append("phrase")
+    return fields
+
+
+def _exclusion_counts(rules, excluded):
+    """How many matches each exclusion phrase removed, in file order."""
+    counts = {(rule.category, rule.phrase): 0 for rule in rules}
+    for match in excluded:
+        key = (match.get("exclusion_category", ""), match.get("phrase", ""))
+        if key in counts:
+            counts[key] += 1
+    return counts
+
+
+def _exclusion_setting_pairs(rules, counts):
+    pairs = []
+    for rule in rules:
+        scope = rule.category or "all categories"
+        number = counts.get((rule.category, rule.phrase), 0)
+        pairs.append((f'Excluded by "{rule.phrase}" ({scope})', str(number)))
+    return pairs
+
+
 def _write_workbook(
     path,
     match_rows,
@@ -497,6 +622,8 @@ def _write_workbook(
     decision_rows,
     context_table,
     settings_pairs,
+    excluded_rows=None,
+    excluded_fields=None,
 ):
     """One workbook with one sheet per table. CSV files are written separately."""
     try:
@@ -508,6 +635,7 @@ def _write_workbook(
 
     category_fields = [
         "category",
+        "definition",
         "matches",
         "documents",
         "groups",
@@ -515,6 +643,13 @@ def _write_workbook(
         "matches_not_kept",
         "matches_uncoded",
         "matches_unclear",
+        "matches_excluded",
+        "sample_size",
+        "sample_coded",
+        "share_kept",
+        "share_kept_low",
+        "share_kept_high",
+        "estimated_kept",
     ]
     group_fields = [
         "category",
@@ -527,6 +662,7 @@ def _write_workbook(
         "matches_uncoded",
         "matches_unclear",
         "matches_kept_per_10000_words",
+        "matches_excluded",
     ]
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -536,6 +672,18 @@ def _write_workbook(
         sheet_fields,
         match_rows,
         widths=_MATCH_WIDTHS,
+        wrap_names=["sentence"],
+        default_width=_NARROW_WIDTH,
+        fit_wrapped=True,
+    )
+    excluded_widths = dict(_MATCH_WIDTHS)
+    excluded_widths["phrase"] = 28
+    _fill_sheet(
+        workbook,
+        "Excluded",
+        excluded_fields or ["phrase"],
+        excluded_rows or [],
+        widths=excluded_widths,
         wrap_names=["sentence"],
         default_width=_NARROW_WIDTH,
         fit_wrapped=True,
@@ -610,6 +758,9 @@ def write_run(
     decision_categories=None,
     context_rows=None,
     should_stop=None,
+    excluded=None,
+    exclusion_rules=None,
+    definitions=None,
 ):
     """Create a new dated folder and return its path. Older runs are left as they were."""
     results_root = Path(config.results_folder)
@@ -629,6 +780,9 @@ def write_run(
             decision_categories,
             context_rows,
             should_stop,
+            excluded,
+            exclusion_rules,
+            definitions,
         )
     except RunStopped:
         _remove_unfinished_run(destination, results_root)
@@ -646,6 +800,9 @@ def _write_run_files(
     decision_categories,
     context_rows,
     should_stop,
+    excluded=None,
+    exclusion_rules=None,
+    definitions=None,
 ):
     check_stop(should_stop)
     chosen = marks_by_category(results_root, destination, categories)
@@ -659,7 +816,7 @@ def _write_run_files(
     match_fields = (
         ["file_name", "file_path"]
         + [renamed for _original, renamed in renamed_meta]
-        + ["language", "short", "category", "term", "location", "sentence", "keep", "notes"]
+        + ["language", "short", "category", "term", "location", "sentence", "in_sample", "keep", "notes"]
     )
     match_rows = []
     carried = {category: 0 for category in categories}
@@ -673,6 +830,7 @@ def _write_run_files(
             "term": match["term"],
             "location": match["location"],
             "sentence": match["sentence"],
+            "in_sample": "no",
             "keep": "",
             "notes": "",
         }
@@ -687,7 +845,46 @@ def _write_run_files(
                 carried[match["category"]] += 1
         match["keep"] = row["keep"]
         match_rows.append(row)
+    assign_sample(
+        matches,
+        getattr(config, "sample_size", 100),
+        getattr(config, "sample_seed", 1),
+        config.count_language,
+    )
+    for match, row in zip(matches, match_rows):
+        row["in_sample"] = "yes" if match.get("in_sample") else "no"
+    category_order = {category: index for index, category in enumerate(categories)}
+    match_rows.sort(
+        key=lambda row: (
+            category_order.get(row["category"], len(category_order)),
+            0 if row["in_sample"] == "yes" else 1,
+        )
+    )
     _write_rows(destination / "matches.csv", match_fields, match_rows)
+    check_stop(should_stop)
+
+    excluded_rows = []
+    for match in excluded or []:
+        row = {
+            "file_name": match["file_name"],
+            "file_path": match["file_path"],
+            "language": match["language"],
+            "short": "yes" if match["short"] else "no",
+            "category": match["category"],
+            "term": match["term"],
+            "phrase": match.get("phrase", ""),
+            "location": match["location"],
+            "sentence": match["sentence"],
+        }
+        for original, renamed in renamed_meta:
+            row[renamed] = match["metadata"].get(original, "")
+        excluded_rows.append(row)
+    excluded_fields = (
+        ["file_name", "file_path"]
+        + [renamed for _original, renamed in renamed_meta]
+        + ["language", "short", "category", "term", "phrase", "location", "sentence"]
+    )
+    _write_rows(destination / "excluded_matches.csv", excluded_fields, excluded_rows)
     check_stop(should_stop)
 
     counted_matches = [
@@ -701,6 +898,7 @@ def _write_run_files(
     grouping = (config.group_column or "").strip()
     category_fields = [
         "category",
+        "definition",
         "matches",
         "documents",
         "groups",
@@ -708,8 +906,26 @@ def _write_run_files(
         "matches_not_kept",
         "matches_uncoded",
         "matches_unclear",
+        "matches_excluded",
+        "sample_size",
+        "sample_coded",
+        "share_kept",
+        "share_kept_low",
+        "share_kept_high",
+        "estimated_kept",
     ]
-    category_rows = category_count_rows(categories, counted_matches, grouping)
+    counted_excluded = [
+        match
+        for match in (excluded or [])
+        if include_in_counts(match["language"], config.count_language)
+    ]
+    category_rows = category_count_rows(
+        categories,
+        counted_matches,
+        grouping,
+        excluded=counted_excluded,
+        definitions=definitions,
+    )
     _write_rows(destination / "counts_by_category.csv", category_fields, category_rows)
     group_fields = [
         "category",
@@ -722,11 +938,16 @@ def _write_run_files(
         "matches_uncoded",
         "matches_unclear",
         "matches_kept_per_10000_words",
+        "matches_excluded",
     ]
     group_rows = []
     if grouping:
         group_rows = group_count_rows(
-            categories, counted_matches, counted_documents, grouping
+            categories,
+            counted_matches,
+            counted_documents,
+            grouping,
+            excluded=counted_excluded,
         )
         _write_rows(destination / "counts_by_group.csv", group_fields, group_rows)
     check_stop(should_stop)
@@ -751,6 +972,7 @@ def _write_run_files(
     else:
         context_note = CONTEXT_SKIPPED_NOTE
     carried_lines = carry_pairs(categories, chosen, carried)
+    exclusion_counts = _exclusion_counts(exclusion_rules or [], excluded or [])
     settings_text, settings_pairs = run_record(
         config,
         corpus,
@@ -759,6 +981,8 @@ def _write_run_files(
         len(counted_matches),
         context_note,
         carried_lines,
+        exclusion_rules=exclusion_rules or [],
+        exclusion_counts=exclusion_counts,
     )
     (destination / "run_settings.txt").write_text(settings_text, encoding="utf-8")
     check_stop(should_stop)
@@ -781,12 +1005,16 @@ def _write_run_files(
         decision_rows,
         (context_rows or []) if getattr(config, "context_words", True) else None,
         settings_pairs,
+        excluded_rows,
+        _excluded_sheet_fields(excluded_fields, group_name, date_name, title_name),
     )
     return destination
 
 
-def category_count_rows(categories, matches, grouping):
+def category_count_rows(categories, matches, grouping, excluded=None, definitions=None):
     rows = []
+    excluded = excluded or []
+    definitions = definitions or {}
     for category in categories:
         chosen = [match for match in matches if match["category"] == category]
         documents = {match["file_path"] for match in chosen}
@@ -796,18 +1024,21 @@ def category_count_rows(categories, matches, grouping):
         else:
             group_count = ""
         tally = _keep_tally(chosen)
-        rows.append(
-            {
-                "category": category,
-                "matches": len(chosen),
-                "documents": len(documents),
-                "groups": group_count,
-                "matches_kept": tally["kept"],
-                "matches_not_kept": tally["not_kept"],
-                "matches_uncoded": tally["uncoded"],
-                "matches_unclear": tally["unclear"],
-            }
-        )
+        dropped = [match for match in excluded if match["category"] == category]
+        row = {
+            "category": category,
+            "definition": definitions.get(category, ""),
+            "matches": len(chosen),
+            "documents": len(documents),
+            "groups": group_count,
+            "matches_kept": tally["kept"],
+            "matches_not_kept": tally["not_kept"],
+            "matches_uncoded": tally["uncoded"],
+            "matches_unclear": tally["unclear"],
+            "matches_excluded": len(dropped),
+        }
+        row.update(_sample_estimates(chosen))
+        rows.append(row)
     return rows
 
 
@@ -816,7 +1047,7 @@ def group_value_from_match(match, column):
     return value or "(blank)"
 
 
-def group_count_rows(categories, matches, documents, grouping):
+def group_count_rows(categories, matches, documents, grouping, excluded=None):
     groups = []
     for document in documents:
         value = group_value(document, grouping)
@@ -826,15 +1057,20 @@ def group_count_rows(categories, matches, documents, grouping):
     for document in documents:
         words_by_group[group_value(document, grouping)] += document.word_count
 
+    excluded = excluded or []
     rows = []
     for category in categories:
         chosen = [match for match in matches if match["category"] == category]
+        dropped = [match for match in excluded if match["category"] == category]
         for value in groups:
             count = sum(1 for match in chosen if group_value_from_match(match, grouping) == value)
             words = words_by_group[value]
             grouped = [
                 match for match in chosen if group_value_from_match(match, grouping) == value
             ]
+            excluded_count = sum(
+                1 for match in dropped if group_value_from_match(match, grouping) == value
+            )
             tally = _keep_tally(grouped)
             rows.append(
                 {
@@ -848,6 +1084,7 @@ def group_count_rows(categories, matches, documents, grouping):
                     "matches_uncoded": tally["uncoded"],
                     "matches_unclear": tally["unclear"],
                     "matches_kept_per_10000_words": per_10000(tally["kept"], words),
+                    "matches_excluded": excluded_count,
                 }
             )
     return rows
@@ -865,6 +1102,17 @@ def _bullet_list(items, empty_note):
     return lines
 
 
+SAMPLE_DRAW_NOTE = (
+    "Each match included in the counts gets a stable random number from the sample seed, "
+    "the file, the category, the term, and its position in the document. "
+    "The sample is the matches with the lowest numbers, up to the sample size for that category. "
+    "A category with no more matches than the sample size is included in full. "
+    "A sample size of 0 includes every counted match. "
+    "The same seed draws the same sample again. "
+    "Adding or removing a few matches changes the sample only where those matches fall among the lowest numbers."
+)
+
+
 def _settings_text(pairs):
     lines = []
     for item in pairs:
@@ -880,7 +1128,15 @@ def _settings_text(pairs):
 
 
 def run_record(
-    config, corpus, destination, match_count, counted_match_count, context_note, carried_lines
+    config,
+    corpus,
+    destination,
+    match_count,
+    counted_match_count,
+    context_note,
+    carried_lines,
+    exclusion_rules=None,
+    exclusion_counts=None,
 ):
     header_fields = ", ".join(config.header_fields) if config.header_fields else "none"
     grouping = config.group_column or "none"
@@ -888,6 +1144,8 @@ def run_record(
         ("Results folder", str(destination)),
         ("Corpus folder", config.corpus_folder),
         ("Term list", config.term_list),
+        ("Exclusion list", (getattr(config, "exclusion_list", "") or "").strip() or "none"),
+        *_exclusion_setting_pairs(exclusion_rules or [], exclusion_counts or {}),
         ("Word decisions file", str(decisions_path(config.term_list))),
         ("Metadata file", config.metadata_file or "none"),
         ("File-path column", config.path_column or "none"),
@@ -907,6 +1165,9 @@ def run_record(
             f"{int(config.short_word_limit)} words",
         ),
         ("Language used for the counts", config.count_language),
+        ("Coding sample size per category", str(int(getattr(config, "sample_size", 100)))),
+        ("Sample seed", str(int(getattr(config, "sample_seed", 1)))),
+        (SAMPLE_DRAW_NOTE, None),
         None,
         ("The sentence file, matches.csv, includes every language.", None),
         ("The count files include only the language chosen above.", None),

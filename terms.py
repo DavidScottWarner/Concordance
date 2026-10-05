@@ -16,6 +16,15 @@ class Term:
     category: str
     term: str
     stem: str
+    definition: str = ""
+
+
+@dataclass
+class Exclusion:
+    """A phrase that removes term matches falling inside it. A blank category applies to every category."""
+
+    category: str
+    phrase: str
 
 
 @dataclass
@@ -52,8 +61,11 @@ def load_terms(path):
             category = lowered.get("category", "")
             term = lowered.get("term", "")
             stem = lowered.get("stem", "")
+            definition = lowered.get("definition", "")
             if category and term:
-                terms.append(Term(category=category, term=term, stem=stem))
+                terms.append(
+                    Term(category=category, term=term, stem=stem, definition=definition)
+                )
     if not terms:
         raise RuntimeError("The term list has no terms.")
     return terms
@@ -68,6 +80,62 @@ def write_terms(path, terms):
             writer.writerow(
                 {"category": term.category, "term": term.term, "stem": term.stem}
             )
+
+
+def load_exclusions(path):
+    """Read an exclusion list. The file is not changed. A blank category applies to every category."""
+    path = Path(path)
+    try:
+        handle = path.open(newline="", encoding="utf-8-sig")
+    except OSError as error:
+        raise RuntimeError(f"The exclusion list could not be opened: {path}") from error
+
+    with handle:
+        reader = csv.DictReader(handle)
+        fieldnames = [name.strip().lower() for name in (reader.fieldnames or []) if name]
+        missing = [name for name in ("category", "phrase") if name not in fieldnames]
+        if missing:
+            raise RuntimeError(
+                "The exclusion list needs columns named category and phrase. "
+                f"This one is missing: {', '.join(missing)}."
+            )
+        rules = []
+        seen = set()
+        for row in reader:
+            lowered = {
+                (key or "").strip().lower(): (value or "").strip()
+                for key, value in row.items()
+                if key
+            }
+            phrase = lowered.get("phrase", "")
+            category = lowered.get("category", "")
+            if not phrase:
+                continue
+            key = (category.casefold(), phrase.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            rules.append(Exclusion(category=category, phrase=phrase))
+    return rules
+
+
+def category_definitions(terms):
+    """The first non-blank definition for each category, in file order."""
+    found = {}
+    for term in terms:
+        text = (term.definition or "").strip()
+        if text and term.category not in found:
+            found[term.category] = text
+    return found
+
+
+def rules_for_category(rules, category):
+    """Phrases for this category, plus phrases whose category is blank."""
+    return [
+        rule
+        for rule in rules
+        if not rule.category or rule.category.casefold() == category.casefold()
+    ]
 
 
 def categories_in_order(terms):
@@ -122,6 +190,52 @@ def find_matches(text, terms):
         for match in pattern.finditer(text):
             hits.append(Hit(start=match.start(), end=match.end(), term=term.term))
     return keep_longest(hits)
+
+
+def phrase_spans(text, rules):
+    """Where each exclusion phrase occurs. Matching follows the same rules as terms."""
+    spans = []
+    if not text:
+        return spans
+    for rule in rules:
+        pattern = compile_term(rule.phrase)
+        if pattern is None:
+            continue
+        for match in pattern.finditer(text):
+            spans.append((match.start(), match.end(), rule))
+    return spans
+
+
+def covering_rule(hit, spans):
+    """The exclusion phrase that contains this match, when one does."""
+    containers = [
+        span for span in spans if span[0] <= hit.start and hit.end <= span[1]
+    ]
+    if not containers:
+        return None
+    containers.sort(
+        key=lambda span: (
+            -(span[1] - span[0]),
+            span[0],
+            span[2].phrase.casefold(),
+        )
+    )
+    return containers[0][2]
+
+
+def split_matches(text, terms, rules):
+    """Term hits, split into counted matches and hits that fall inside an exclusion phrase."""
+    hits = find_matches(text, terms)
+    spans = phrase_spans(text, rules)
+    kept = []
+    excluded = []
+    for hit in hits:
+        rule = covering_rule(hit, spans)
+        if rule is None:
+            kept.append(hit)
+        else:
+            excluded.append((hit, rule))
+    return kept, excluded
 
 
 def keep_longest(hits):
