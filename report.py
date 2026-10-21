@@ -12,7 +12,7 @@ from statistics import NormalDist
 from terms import write_terms
 from variants import DECISION_COLUMNS, decisions_path, read_decision_rows
 from context_words import CONTEXT_COLUMNS, CONTEXT_NOTE, CONTEXT_SKIPPED_NOTE
-from corpus import RunStopped, check_stop
+from corpus import NO_BODY_LANGUAGE, RunStopped, check_stop
 
 RESERVED_COLUMNS = {
     "file_name",
@@ -24,12 +24,25 @@ RESERVED_COLUMNS = {
     "location",
     "sentence",
     "in_sample",
+    "code",
     "keep",
     "notes",
 }
 
+# Stored label, then the count name. Matching ignores capitalization and extra spaces.
+_CODE_MARKS = (
+    ("Value", "value"),
+    ("Descriptive", "descriptive"),
+    ("Wrong sense", "wrong_sense"),
+    ("Unclear", "unclear"),
+)
+_CODE_BY_KEY = {" ".join(label.split()).casefold(): (label, kind) for label, kind in _CODE_MARKS}
+_SHARE_KINDS = {"value", "descriptive", "wrong_sense"}
+
 
 def include_in_counts(language, choice):
+    if _cell_text(language).casefold() == NO_BODY_LANGUAGE.casefold():
+        return False
     choice = (choice or "").strip()
     if choice.casefold() in {"", "all", "all languages"}:
         return True
@@ -121,15 +134,37 @@ def _cell_text(value):
     return str(value).strip()
 
 
+def _lookup(row, name):
+    """A column by this name, ignoring capitalization. None when the column is absent."""
+    if not row:
+        return None
+    if name in row:
+        return row.get(name)
+    folded = name.casefold()
+    for key, value in row.items():
+        if key is not None and str(key).strip().casefold() == folded:
+            return value
+    return None
+
+
+def _code_text(row):
+    """The mark from a code column, or from an older keep column when code is blank."""
+    for name in ("code", "keep"):
+        text = _cell_text(_lookup(row, name))
+        if text:
+            return text
+    return ""
+
+
 def _marks_from_rows(rows):
-    """Map each match to its keep and notes text. A later row for the same match wins."""
+    """Map each match to its code and notes text. A later row for the same match wins."""
     marks = {}
     for row in rows:
-        keep = _cell_text(row.get("keep"))
-        notes = _cell_text(row.get("notes"))
-        if not keep and not notes:
+        code = _code_text(row)
+        notes = _cell_text(_lookup(row, "notes"))
+        if not code and not notes:
             continue
-        marks[_mark_key(row)] = (keep, notes)
+        marks[_mark_key(row)] = (code, notes)
     return marks
 
 
@@ -187,27 +222,27 @@ def _read_workbook_rows(path):
 
 
 def _combine_mark_rows(csv_rows, workbook_rows):
-    """Prefer keep and notes from the workbook, matched back to the file path in the CSV."""
+    """Prefer code and notes from the workbook, matched back to the file path in the CSV."""
     if workbook_rows is None:
         return _marks_from_rows(csv_rows)
-    if any(_cell_text(row.get("file_path")) for row in workbook_rows):
+    if any(_cell_text(_lookup(row, "file_path")) for row in workbook_rows):
         return _marks_from_rows(workbook_rows)
     from collections import defaultdict
 
     waiting = defaultdict(list)
     for row in workbook_rows:
         waiting[_loose_key(row)].append(
-            (_cell_text(row.get("keep")), _cell_text(row.get("notes")))
+            (_code_text(row), _cell_text(_lookup(row, "notes")))
         )
     marks = {}
     for row in csv_rows:
-        keep = _cell_text(row.get("keep"))
-        notes = _cell_text(row.get("notes"))
+        code = _code_text(row)
+        notes = _cell_text(_lookup(row, "notes"))
         queued = waiting.get(_loose_key(row))
         if queued:
-            keep, notes = queued.pop(0)
-        if keep or notes:
-            marks[_mark_key(row)] = (keep, notes)
+            code, notes = queued.pop(0)
+        if code or notes:
+            marks[_mark_key(row)] = (code, notes)
     return marks
 
 
@@ -317,16 +352,21 @@ def carry_pairs(categories, chosen, counts):
     return pairs
 
 
-def keep_class(value):
-    """yes/y kept, no/n not kept, blank not yet coded, anything else unclear."""
-    text = _cell_text(value).casefold()
-    if text in {"yes", "y"}:
-        return "kept"
-    if text in {"no", "n"}:
-        return "not_kept"
-    if not text:
-        return "uncoded"
-    return "unclear"
+def interpret_code(value):
+    """Return (stored text, kind) for one hand-coding mark.
+
+    The four marks are Value, Descriptive, Wrong sense, and Unclear.
+    Capitalization and extra spaces do not matter. Blank is uncoded.
+    Anything else is unrecognized and is counted as uncoded.
+    """
+    raw = _cell_text(value)
+    folded = " ".join(raw.split()).casefold()
+    if not folded:
+        return "", "uncoded"
+    found = _CODE_BY_KEY.get(folded)
+    if found is None:
+        return raw, "unrecognized"
+    return found
 
 
 def _sample_rank(seed, match):
@@ -370,10 +410,10 @@ def assign_sample(matches, sample_size, seed, count_language):
             match["in_sample"] = True
 
 
-def _wilson_bounds(kept, coded):
-    """A 95% Wilson interval for the share of kept matches."""
+def _wilson_bounds(successes, coded):
+    """A 95% Wilson interval for successes out of coded matches."""
     z = NormalDist().inv_cdf(0.975)
-    phat = kept / coded
+    phat = successes / coded
     z2 = z * z
     denominator = 1.0 + z2 / coded
     center = (phat + z2 / (2.0 * coded)) / denominator
@@ -390,37 +430,49 @@ def _share_text(value):
 
 
 def _sample_estimates(chosen):
-    """Estimates from the coded sample. Blank when none of the sample is coded."""
+    """Estimates from the coded sample. Blank when none of the sample is in the share."""
     sampled = [match for match in chosen if match.get("in_sample")]
-    coded = [
-        match
-        for match in sampled
-        if keep_class(match.get("keep")) in {"kept", "not_kept"}
-    ]
-    kept = sum(1 for match in coded if keep_class(match.get("keep")) == "kept")
+    coded = 0
+    values = 0
+    for match in sampled:
+        _stored, kind = interpret_code(match.get("code"))
+        if kind not in _SHARE_KINDS:
+            continue
+        coded += 1
+        if kind == "value":
+            values += 1
     result = {
         "sample_size": len(sampled),
-        "sample_coded": len(coded),
-        "share_kept": "",
-        "share_kept_low": "",
-        "share_kept_high": "",
-        "estimated_kept": "",
+        "sample_coded": coded,
+        "share_value": "",
+        "share_value_low": "",
+        "share_value_high": "",
+        "estimated_value": "",
     }
     if not coded:
         return result
-    share = kept / len(coded)
-    low, high = _wilson_bounds(kept, len(coded))
-    result["share_kept"] = _share_text(share)
-    result["share_kept_low"] = _share_text(low)
-    result["share_kept_high"] = _share_text(high)
-    result["estimated_kept"] = f"{share * len(chosen):.1f}"
+    share = values / coded
+    low, high = _wilson_bounds(values, coded)
+    result["share_value"] = _share_text(share)
+    result["share_value_low"] = _share_text(low)
+    result["share_value_high"] = _share_text(high)
+    result["estimated_value"] = f"{share * len(chosen):.1f}"
     return result
 
 
-def _keep_tally(matches):
-    tally = {"kept": 0, "not_kept": 0, "uncoded": 0, "unclear": 0}
+def _code_tally(matches):
+    tally = {
+        "value": 0,
+        "descriptive": 0,
+        "wrong_sense": 0,
+        "uncoded": 0,
+        "unclear": 0,
+    }
     for match in matches:
-        tally[keep_class(match.get("keep"))] += 1
+        _stored, kind = interpret_code(match.get("code"))
+        if kind == "unrecognized":
+            kind = "uncoded"
+        tally[kind] += 1
     return tally
 
 
@@ -432,7 +484,7 @@ def _write_rows(path, fieldnames, rows):
 
 
 _MATCH_WIDTHS = {
-    "keep": 16,
+    "code": 16,
     "notes": 32,
     "sentence": 80,
     "in_sample": 12,
@@ -529,6 +581,26 @@ def _fill_sheet(
     return sheet
 
 
+def _add_code_dropdown(sheet, fieldnames):
+    """Offer the four hand-coding marks on the code column. A blank cell stays allowed."""
+    if "code" not in fieldnames:
+        return
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    index = fieldnames.index("code") + 1
+    letter = get_column_letter(index)
+    last_row = max(sheet.max_row, 2)
+    labels = ",".join(label for label, _kind in _CODE_MARKS)
+    check = DataValidation(
+        type="list",
+        formula1=f'"{labels}"',
+        allow_blank=True,
+    )
+    check.add(f"{letter}2:{letter}{last_row}")
+    sheet.add_data_validation(check)
+
+
 def _special_column(columns, exact, contains=""):
     """A metadata column with this name, or one whose name contains the word."""
     for column in columns:
@@ -564,7 +636,7 @@ def match_sheet_fields(match_fields, group_name, date_name, title_name):
         "term",
         "sentence",
         "in_sample",
-        "keep",
+        "code",
         "notes",
         "category",
         "language",
@@ -639,17 +711,18 @@ def _write_workbook(
         "matches",
         "documents",
         "groups",
-        "matches_kept",
-        "matches_not_kept",
+        "matches_value",
+        "matches_descriptive",
+        "matches_wrong_sense",
         "matches_uncoded",
         "matches_unclear",
         "matches_excluded",
         "sample_size",
         "sample_coded",
-        "share_kept",
-        "share_kept_low",
-        "share_kept_high",
-        "estimated_kept",
+        "share_value",
+        "share_value_low",
+        "share_value_high",
+        "estimated_value",
     ]
     group_fields = [
         "category",
@@ -657,16 +730,17 @@ def _write_workbook(
         "matches",
         "words",
         "matches_per_10000_words",
-        "matches_kept",
-        "matches_not_kept",
+        "matches_value",
+        "matches_descriptive",
+        "matches_wrong_sense",
         "matches_uncoded",
         "matches_unclear",
-        "matches_kept_per_10000_words",
+        "matches_value_per_10000_words",
         "matches_excluded",
     ]
     workbook = Workbook()
     workbook.remove(workbook.active)
-    _fill_sheet(
+    matches_sheet = _fill_sheet(
         workbook,
         "Matches",
         sheet_fields,
@@ -676,6 +750,7 @@ def _write_workbook(
         default_width=_NARROW_WIDTH,
         fit_wrapped=True,
     )
+    _add_code_dropdown(matches_sheet, sheet_fields)
     excluded_widths = dict(_MATCH_WIDTHS)
     excluded_widths["phrase"] = 28
     _fill_sheet(
@@ -816,10 +891,12 @@ def _write_run_files(
     match_fields = (
         ["file_name", "file_path"]
         + [renamed for _original, renamed in renamed_meta]
-        + ["language", "short", "category", "term", "location", "sentence", "in_sample", "keep", "notes"]
+        + ["language", "short", "category", "term", "location", "sentence", "in_sample", "code", "notes"]
     )
     match_rows = []
     carried = {category: 0 for category in categories}
+    unrecognized = []
+    seen_unrecognized = set()
     for match in matches:
         row = {
             "file_name": match["file_name"],
@@ -831,19 +908,25 @@ def _write_run_files(
             "location": match["location"],
             "sentence": match["sentence"],
             "in_sample": "no",
-            "keep": "",
+            "code": "",
             "notes": "",
         }
         for original, renamed in renamed_meta:
             row[renamed] = match["metadata"].get(original, "")
         _source, marks = chosen.get(match["category"], (None, {}))
-        keep, notes = marks.get(_mark_key(row), ("", ""))
-        if keep or notes:
-            row["keep"] = keep
+        raw_code, notes = marks.get(_mark_key(row), ("", ""))
+        stored, kind = interpret_code(raw_code)
+        if kind == "unrecognized":
+            item = (row["file_name"], row["term"], stored)
+            if item not in seen_unrecognized:
+                seen_unrecognized.add(item)
+                unrecognized.append(item)
+        if stored or notes:
+            row["code"] = stored
             row["notes"] = notes
             if match["category"] in carried:
                 carried[match["category"]] += 1
-        match["keep"] = row["keep"]
+        match["code"] = row["code"]
         match_rows.append(row)
     assign_sample(
         matches,
@@ -902,17 +985,18 @@ def _write_run_files(
         "matches",
         "documents",
         "groups",
-        "matches_kept",
-        "matches_not_kept",
+        "matches_value",
+        "matches_descriptive",
+        "matches_wrong_sense",
         "matches_uncoded",
         "matches_unclear",
         "matches_excluded",
         "sample_size",
         "sample_coded",
-        "share_kept",
-        "share_kept_low",
-        "share_kept_high",
-        "estimated_kept",
+        "share_value",
+        "share_value_low",
+        "share_value_high",
+        "estimated_value",
     ]
     counted_excluded = [
         match
@@ -933,11 +1017,12 @@ def _write_run_files(
         "matches",
         "words",
         "matches_per_10000_words",
-        "matches_kept",
-        "matches_not_kept",
+        "matches_value",
+        "matches_descriptive",
+        "matches_wrong_sense",
         "matches_uncoded",
         "matches_unclear",
-        "matches_kept_per_10000_words",
+        "matches_value_per_10000_words",
         "matches_excluded",
     ]
     group_rows = []
@@ -983,6 +1068,12 @@ def _write_run_files(
         carried_lines,
         exclusion_rules=exclusion_rules or [],
         exclusion_counts=exclusion_counts,
+        no_body_count=sum(
+            1
+            for document in corpus.documents
+            if document.language == NO_BODY_LANGUAGE
+        ),
+        unrecognized=unrecognized,
     )
     (destination / "run_settings.txt").write_text(settings_text, encoding="utf-8")
     check_stop(should_stop)
@@ -1023,7 +1114,7 @@ def category_count_rows(categories, matches, grouping, excluded=None, definition
             group_count = len(groups)
         else:
             group_count = ""
-        tally = _keep_tally(chosen)
+        tally = _code_tally(chosen)
         dropped = [match for match in excluded if match["category"] == category]
         row = {
             "category": category,
@@ -1031,8 +1122,9 @@ def category_count_rows(categories, matches, grouping, excluded=None, definition
             "matches": len(chosen),
             "documents": len(documents),
             "groups": group_count,
-            "matches_kept": tally["kept"],
-            "matches_not_kept": tally["not_kept"],
+            "matches_value": tally["value"],
+            "matches_descriptive": tally["descriptive"],
+            "matches_wrong_sense": tally["wrong_sense"],
             "matches_uncoded": tally["uncoded"],
             "matches_unclear": tally["unclear"],
             "matches_excluded": len(dropped),
@@ -1071,7 +1163,7 @@ def group_count_rows(categories, matches, documents, grouping, excluded=None):
             excluded_count = sum(
                 1 for match in dropped if group_value_from_match(match, grouping) == value
             )
-            tally = _keep_tally(grouped)
+            tally = _code_tally(grouped)
             rows.append(
                 {
                     "category": category,
@@ -1079,11 +1171,12 @@ def group_count_rows(categories, matches, documents, grouping, excluded=None):
                     "matches": count,
                     "words": words,
                     "matches_per_10000_words": per_10000(count, words),
-                    "matches_kept": tally["kept"],
-                    "matches_not_kept": tally["not_kept"],
+                    "matches_value": tally["value"],
+                    "matches_descriptive": tally["descriptive"],
+                    "matches_wrong_sense": tally["wrong_sense"],
                     "matches_uncoded": tally["uncoded"],
                     "matches_unclear": tally["unclear"],
-                    "matches_kept_per_10000_words": per_10000(tally["kept"], words),
+                    "matches_value_per_10000_words": per_10000(tally["value"], words),
                     "matches_excluded": excluded_count,
                 }
             )
@@ -1112,6 +1205,29 @@ SAMPLE_DRAW_NOTE = (
     "Adding or removing a few matches changes the sample only where those matches fall among the lowest numbers."
 )
 
+CODE_MARKS_NOTE = (
+    "The code column on the Matches sheet records a hand-coding mark. "
+    "The four marks are Value, Descriptive, Wrong sense, and Unclear. "
+    "A blank cell means the match has not been coded. "
+    "Capital letters and extra spaces do not matter. "
+    "Marks saved in an older keep column are read in the same way. "
+    "Any other value is an unrecognized mark. It is listed in this sheet with the file name and the term, "
+    "and it is counted as uncoded."
+)
+
+SHARE_VALUE_NOTE = (
+    "share_value divides the sampled matches marked Value by the sampled matches marked "
+    "Value, Descriptive, or Wrong sense. "
+    "sample_coded is that second number. "
+    "Unclear is left out of the division and is reported only as a count. "
+    "share_value_low and share_value_high are a 95% Wilson confidence interval around share_value: "
+    "a range that is likely to contain the share you would see if you coded the whole category in the same way. "
+    "estimated_value multiplies share_value by the category's full match count, "
+    "which estimates how many matches would be marked Value if every match were coded like the sample. "
+    "Those four cells are left blank when none of the sampled matches is marked Value, Descriptive, or Wrong sense. "
+    "The group counts do not include these estimates."
+)
+
 
 def _settings_text(pairs):
     lines = []
@@ -1127,6 +1243,16 @@ def _settings_text(pairs):
     return "\n".join(lines)
 
 
+def _unrecognized_pairs(items):
+    """Run-settings rows for marks that are not one of the four codes."""
+    if not items:
+        return []
+    pairs = [("Unrecognized hand-coding marks, counted as uncoded:", None)]
+    for file_name, term, value in items:
+        pairs.append((f"{file_name} ({term})", value))
+    return pairs
+
+
 def run_record(
     config,
     corpus,
@@ -1137,6 +1263,8 @@ def run_record(
     carried_lines,
     exclusion_rules=None,
     exclusion_counts=None,
+    no_body_count=0,
+    unrecognized=None,
 ):
     header_fields = ", ".join(config.header_fields) if config.header_fields else "none"
     grouping = config.group_column or "none"
@@ -1168,10 +1296,18 @@ def run_record(
         ("Coding sample size per category", str(int(getattr(config, "sample_size", 100)))),
         ("Sample seed", str(int(getattr(config, "sample_seed", 1)))),
         (SAMPLE_DRAW_NOTE, None),
+        (CODE_MARKS_NOTE, None),
+        (SHARE_VALUE_NOTE, None),
+        *_unrecognized_pairs(unrecognized or []),
         None,
         ("The sentence file, matches.csv, includes every language.", None),
         ("The count files include only the language chosen above.", None),
         ("All languages means every document is included in the counts.", None),
+        ("Documents with no body (title only)", str(no_body_count)),
+        (
+            "These documents are excluded from the counts because they have no proposal text.",
+            None,
+        ),
         (context_note, None),
         *carried_lines,
         ("Matches per 10,000 words uses the words in the text that was searched.", None),

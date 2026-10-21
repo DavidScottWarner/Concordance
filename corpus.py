@@ -12,6 +12,9 @@ from terms import word_count
 # sentence such as "this proposal completes rfp 15:" through.
 HEADER_LINE = re.compile(r"^([A-Za-z0-9_]+):[ \t]*(.*)$")
 
+# A file of header lines with no proposal text. Language detection is not attempted.
+NO_BODY_LANGUAGE = "No body"
+
 _detector = None
 
 
@@ -159,6 +162,16 @@ def split_header(text):
             return {}, text
         header[last_key] = (header[last_key] + "\n" + line.strip()).strip()
     return header, ""
+
+
+def has_no_body(raw_text):
+    """True when the text after the header is empty or only whitespace.
+
+    This uses the same header rules as split_header. A file that does not
+    start with a header line has a body: the whole text.
+    """
+    _header, body = split_header(raw_text or "")
+    return not body.strip()
 
 
 def clean_text(text):
@@ -315,16 +328,30 @@ def load_corpus(config, status=None, should_stop=None):
         parts, language_source = _searched_parts(raw_text, config)
         counted = sum(word_count(part["text"]) for part in parts)
         pending.append(
-            (resolved, metadata, parts, language_source, counted, limit > 0 and counted < limit)
+            (
+                resolved,
+                metadata,
+                parts,
+                language_source,
+                counted,
+                limit > 0 and counted < limit,
+                has_no_body(raw_text),
+            )
         )
 
     detect_total = len(pending)
-    if detect_total:
+    if any(not item[-1] for item in pending):
         report_status(status, "Preparing language detection...")
         get_detector()
-    for index, (resolved, metadata, parts, language_source, counted, short) in enumerate(
-        pending, start=1
-    ):
+    for index, (
+        resolved,
+        metadata,
+        parts,
+        language_source,
+        counted,
+        short,
+        no_body,
+    ) in enumerate(pending, start=1):
         check_stop(should_stop)
         report_status(
             status,
@@ -332,13 +359,17 @@ def load_corpus(config, status=None, should_stop=None):
             index,
             detect_total,
         )
+        if no_body:
+            language = NO_BODY_LANGUAGE
+        else:
+            language = detect_language(language_source)
         loaded.documents.append(
             Document(
                 absolute_path=str(resolved),
                 file_name=resolved.name,
                 metadata=dict(metadata),
                 parts=parts,
-                language=detect_language(language_source),
+                language=language,
                 word_count=counted,
                 short=short,
             )
